@@ -2401,10 +2401,14 @@
         //  用以替代 MediaPipe 的 wasm 推理 —— 规避 OpenDeploy 静态托管的
         //  CSP（其 script-src 缺 'wasm-unsafe-eval'，会阻死 wasm 编译）。
         //
-        //  三信号融合，保证「静止也可见、动起来有反应」：
-        //   1) 帧差分 —— 检测运动区域（挥手、走动）
-        //   2) 自适应背景对比 —— 检测与背景颜色不同的人体（即使完全静止）
-        //   3) 残影种子 —— 真实信号过低时淡入最近形状的记忆，启动/静止不空白
+        //  设计要点：
+        //   1) 选择性背景学习 —— 仅「非前景」像素才更新背景，静止的人体
+        //      不会被吸收进背景，从而静止时也持续可见（解决"站着不动就消失"）。
+        //   2) 帧差分 —— 检测运动区域（挥手、走动）。
+        //   3) 最大连通域 + 形态学闭运算 —— 仅保留最大前景块、填补内部空洞，
+        //      剔除零散噪点，使人体轮廓清晰可辨。
+        //   4) 边缘柔化 + 时间平滑 —— 似光晕/墨韵的柔边，并抑制闪烁。
+        //   5) 残影种子 —— 真实信号过低时淡入最近形状的记忆，启动/静止不空白。
         // ================================================================
         class ForegroundExtractor {
             constructor(procW = 160, procH = 120) {
@@ -2426,7 +2430,7 @@
                 this.accum = new Float32Array(n);          // 融合后的「存在感」图
                 this.ghost = new Float32Array(n);          // 残影：最近出现过的形状记忆
                 this.frameIdx = 0;
-                this.WARMUP = 24;                          // 前 N 帧建立背景，不输出
+                this.WARMUP = 14;                          // 前 N 帧建立背景，不输出
 
                 // 运动热点网格（代理「手」）
                 this.activeHands = [];
@@ -2434,6 +2438,12 @@
 
                 // 残影种子强度（当真实存在感过低时淡入，保证静止也可见）
                 this.seed = 0;
+
+                // 复用缓冲（避免每帧分配）
+                this._binary = new Uint8Array(n);
+                this._label = new Int32Array(n);
+                this._tmpBin = new Uint8Array(n);
+                this._maskSmooth = new Float32Array(n); // 时间平滑后的 alpha
             }
 
             update(videoEl) {
@@ -2442,20 +2452,22 @@
                 const d = this.vctx.getImageData(0, 0, w, h).data;
 
                 // —— 阈值与速率（针对摄像头噪声校准）——
-                const MOT_THRESH   = 16;    // 帧差运动阈值
-                const STATIC_BASE  = 28;    // 背景对比基础阈值
-                const STATIC_K     = 3.2;   // 方差自适应乘子
-                const BG_ALPHA     = 0.012; // 背景学习率（缓慢，使静止人体约 2s 后显形）
-                const VAR_ALPHA    = 0.03;  // 方差 EMA 速率
-                const ACCUM_RISE   = 0.55;  // 存在感上升
-                const ACCUM_DECAY  = 0.95;  // 存在感衰减（慢 → 静止时持续可见）
-                const OUTPUT_THRESH = 42;   // 输出遮罩阈值
+                const MOT_THRESH = 16;     // 帧差运动阈值
+                const STATIC_BASE = 26;    // 背景对比基础阈值
+                const STATIC_K = 3.2;      // 方差自适应乘子
+                const BG_ALPHA = 0.010;    // 背景学习率（仅非前景处生效）
+                const VAR_ALPHA = 0.03;    // 方差 EMA 速率
+                const ACCUM_RISE = 0.6;    // 存在感上升
+                const ACCUM_DECAY = 0.94;  // 存在感衰减
+                const OUTPUT_THRESH = 40;  // 输出遮罩阈值
+                const BG_LEARN_MAX = OUTPUT_THRESH * 0.55; // 仅"非前景"像素才学习背景
 
                 const cols = this.cols, rows = this.rows;
                 const cSum = new Float32Array(cols * rows);
                 const cX = new Float32Array(cols * rows);
                 const cY = new Float32Array(cols * rows);
                 let presenceCount = 0;
+                const binary = this._binary;
 
                 for (let i = 0; i < n; i++) {
                     const o = i * 4;
@@ -2465,40 +2477,40 @@
                     if (this.frameIdx < this.WARMUP) {
                         this.bg[o] = r; this.bg[o + 1] = g; this.bg[o + 2] = b;
                         this.bgVar[i] = 0; this.prevGray[i] = gy;
+                        binary[i] = 0;
                         continue; // warmup 期间不输出
                     }
 
-                    // 帧差（运动）
                     const df = Math.abs(gy - this.prevGray[i]);
-
-                    // 自适应背景 + 方差
                     const br = this.bg[o], bg_g = this.bg[o + 1], bb = this.bg[o + 2];
                     const dr = r - br, dg = g - bg_g, db = b - bb;
                     const staticDist = Math.sqrt(dr * dr + dg * dg + db * db);
                     const thresh = STATIC_BASE + STATIC_K * Math.sqrt(this.bgVar[i]);
                     const isStaticFG = staticDist > thresh;   // 与背景不同 → 人（即使静止）
                     const isMotion = df > MOT_THRESH;
+                    const isFG = isStaticFG || isMotion;
 
-                    // 背景缓慢学习（处处都学，使静止人体约 2s 后对比显形；背景区域更快收敛）
-                    this.bg[o]     += (r - this.bg[o]) * BG_ALPHA;
-                    this.bg[o + 1] += (g - this.bg[o + 1]) * BG_ALPHA;
-                    this.bg[o + 2] += (b - this.bg[o + 2]) * BG_ALPHA;
-                    const resid = gy - (br * 0.299 + bg_g * 0.587 + bb * 0.114);
-                    this.bgVar[i] += (resid * resid - this.bgVar[i]) * VAR_ALPHA;
-
-                    // 融合信号：运动 或 静态对比 → 提升存在感；否则缓慢衰减
-                    const signal = isStaticFG || isMotion;
-                    if (signal) {
-                        const add = isMotion ? df * ACCUM_RISE : 55; // 静止对比给稳定增益
+                    if (isFG) {
+                        // 前景：存在感上升，并冻结该处背景（不被吸收）
+                        const add = isMotion ? df * ACCUM_RISE : 60; // 静止对比给稳定增益
                         this.accum[i] = Math.min(255, this.accum[i] + add);
-                        // 残影记忆：记录最近出现的形状（似真似幻的"痕迹"）
-                        this.ghost[i] = Math.max(this.ghost[i] * 0.992, 1);
+                        this.ghost[i] = Math.max(this.ghost[i] * 0.99, 1);
                     } else {
                         this.accum[i] *= ACCUM_DECAY;
-                        this.ghost[i] *= 0.992;
+                        this.ghost[i] *= 0.99;
+                        // 选择性背景学习：仅非前景像素更新背景，
+                        // 静止的人体因此不会被吸收 → 静止也持续可见
+                        if (this.accum[i] < BG_LEARN_MAX) {
+                            this.bg[o]     += (r - this.bg[o]) * BG_ALPHA;
+                            this.bg[o + 1] += (g - this.bg[o + 1]) * BG_ALPHA;
+                            this.bg[o + 2] += (b - this.bg[o + 2]) * BG_ALPHA;
+                            const resid = gy - (br * 0.299 + bg_g * 0.587 + bb * 0.114);
+                            this.bgVar[i] += (resid * resid - this.bgVar[i]) * VAR_ALPHA;
+                        }
                     }
 
-                    if (this.accum[i] > OUTPUT_THRESH) presenceCount++;
+                    binary[i] = this.accum[i] > OUTPUT_THRESH ? 1 : 0;
+                    if (binary[i]) presenceCount++;
 
                     // 运动热点（代理「手」）
                     if (df > MOT_THRESH * 2) {
@@ -2510,26 +2522,31 @@
                 }
                 this.frameIdx++;
 
-                // 残影种子：真实存在感过低时淡入（保证启动/完全静止也能看到自己）
+                // 残影种子：真实存在感过低时淡入最近形状（启动/完全静止不空白）
                 const presenceRatio = presenceCount / n;
-                if (presenceRatio < 0.04) this.seed = Math.min(1, this.seed + 0.03);
-                else this.seed = Math.max(0, this.seed - 0.06);
+                if (presenceRatio < 0.035) this.seed = Math.min(1, this.seed + 0.025);
+                else this.seed = Math.max(0, this.seed - 0.07);
 
-                // 产出遮罩
+                // 轮廓清晰化：闭运算填充空洞/连接肢体 → 最大连通域剔除噪点
+                this._morphClose(binary, w, h);
+                this._largestBlob(binary, w, h);
+
+                // 产出遮罩：真实轮廓(255) 或 残影种子(软)，柔化边缘 + 时间平滑
                 const fgImg = this.fgCtx.createImageData(w, h);
                 const fd = fgImg.data;
+                const smooth = this._maskSmooth;
                 for (let i = 0; i < n; i++) {
                     const o = i * 4;
-                    let a = this.accum[i] > OUTPUT_THRESH ? 255 : 0;
-                    if (this.seed > 0) {
-                        // 用残影记忆作软形状，而非生硬矩形
-                        const sa = this.seed * this.ghost[i] * 210;
-                        if (sa > a) a = Math.min(255, sa);
+                    let a = binary[i] ? 255 : 0;
+                    if (a === 0 && this.seed > 0) {
+                        a = Math.min(255, this.seed * this.ghost[i] * 200);
                     }
-                    fd[o] = 255; fd[o + 1] = 255; fd[o + 2] = 255; fd[o + 3] = a;
+                    smooth[i] = smooth[i] * 0.7 + a * 0.3; // 轻量 EMA 减少闪烁
+                    const av = smooth[i] | 0;
+                    fd[o] = 255; fd[o + 1] = 255; fd[o + 2] = 255; fd[o + 3] = av;
                 }
                 this.fgCtx.putImageData(fgImg, 0, 0);
-                if (this.seed < 0.5) this._dilate(this.fgCtx, w, h); // 有真实轮廓时才膨胀
+                this._boxBlurAlpha(this.fgCtx, w, h); // 边缘柔化（似光晕/墨韵）
 
                 // 由运动网格选 Top-2 热点作为「手」（镜像映射到屏幕坐标）
                 const idx = [];
@@ -2550,22 +2567,82 @@
                 this.activeHands = hands;
             }
 
-            /** 3×3 膨胀核：对 alpha 通道做一次最大值滤波，填补轮廓内的小空洞 */
-            _dilate(ctx, w, h) {
+            /** 形态学闭运算：先膨胀后腐蚀，填补轮廓内部空洞并平滑边界 */
+            _morphClose(bin, w, h) {
+                this._dilateBin(bin, w, h);
+                this._erodeBin(bin, w, h);
+            }
+            _dilateBin(bin, w, h) {
+                const tmp = this._tmpBin; tmp.set(bin);
+                for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+                    const i = y * w + x;
+                    if (tmp[i]) continue;
+                    let on = false;
+                    for (let dy = -1; dy <= 1 && !on; dy++) for (let dx = -1; dx <= 1 && !on; dx++) {
+                        const nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h && tmp[ny * w + nx]) { on = true; break; }
+                    }
+                    if (on) bin[i] = 1;
+                }
+            }
+            _erodeBin(bin, w, h) {
+                const tmp = this._tmpBin; tmp.set(bin);
+                for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+                    const i = y * w + x;
+                    if (!tmp[i]) continue;
+                    let off = false;
+                    for (let dy = -1; dy <= 1 && !off; dy++) for (let dx = -1; dx <= 1 && !off; dx++) {
+                        const nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < w && ny >= 0 && ny < h && !tmp[ny * w + nx]) { off = true; break; }
+                    }
+                    if (off) bin[i] = 0;
+                }
+            }
+
+            /** 最大连通域（8 连通 BFS）：仅保留面积最大的前景块，剔除零散噪点 */
+            _largestBlob(bin, w, h) {
+                const n = w * h;
+                const label = this._label;
+                label.fill(0);
+                const areas = [];
+                const stack = [];
+                let cur = 0;
+                for (let s = 0; s < n; s++) {
+                    if (bin[s] && label[s] === 0) {
+                        cur++;
+                        let area = 0;
+                        stack.length = 0; stack.push(s); label[s] = cur;
+                        while (stack.length) {
+                            const p = stack.pop(); area++;
+                            const px = p % w, py = (p / w) | 0;
+                            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+                                if (!dx && !dy) continue;
+                                const nx = px + dx, ny = py + dy;
+                                if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+                                const np = ny * w + nx;
+                                if (bin[np] && label[np] === 0) { label[np] = cur; stack.push(np); }
+                            }
+                        }
+                        areas.push(area);
+                    }
+                }
+                if (cur <= 1) return; // 仅一个块则无需处理
+                let best = 1, bestArea = areas[0];
+                for (let l = 2; l <= cur; l++) if (areas[l - 1] > bestArea) { bestArea = areas[l - 1]; best = l; }
+                for (let i = 0; i < n; i++) if (label[i] !== best) bin[i] = 0;
+            }
+
+            /** 对 alpha 通道做 3×3 盒式模糊，柔化边缘（似光晕/墨韵） */
+            _boxBlurAlpha(ctx, w, h) {
                 const img = ctx.getImageData(0, 0, w, h);
                 const src = img.data;
                 const out = new Uint8ClampedArray(src);
-                for (let y = 1; y < h - 1; y++) {
-                    for (let x = 1; x < w - 1; x++) {
-                        let maxA = 0;
-                        for (let dy = -1; dy <= 1; dy++) {
-                            for (let dx = -1; dx <= 1; dx++) {
-                                const a = src[((y + dy) * w + (x + dx)) * 4 + 3];
-                                if (a > maxA) maxA = a;
-                            }
-                        }
-                        out[(y * w + x) * 4 + 3] = maxA;
+                for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+                    let sum = 0;
+                    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+                        sum += src[((y + dy) * w + (x + dx)) * 4 + 3];
                     }
+                    out[(y * w + x) * 4 + 3] = sum / 9;
                 }
                 img.data.set(out);
                 ctx.putImageData(img, 0, 0);
