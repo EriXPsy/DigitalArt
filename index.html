@@ -2400,6 +2400,9 @@
         //  「势场」(运动强度)，并取运动最活跃的网格单元作为手部交互代理。
         //  用以替代 MediaPipe 的 wasm 推理 —— 规避 OpenDeploy 静态托管的
         //  CSP（其 script-src 缺 'wasm-unsafe-eval'，会阻死 wasm 编译）。
+        //
+        //  算法：帧差分（当前帧 vs 上一帧）→ 运动热图 → 指数衰减累积
+        //  → 阈值二值化 → 形态学清理。无需干净背景帧，首帧即可工作。
         // ================================================================
         class ForegroundExtractor {
             constructor(procW = 160, procH = 120) {
@@ -2411,68 +2414,82 @@
                 this.fg.width = procW; this.fg.height = procH;
                 this.fgCtx = this.fg.getContext('2d');
                 this.fgCanvas = this.fg;          // 供 processMask 直接 drawImage 采样
-                this.bg = new Float32Array(procW * procH * 3);   // 背景 RGB 模型
-                this.prev = new Float32Array(procW * procH * 3); // 上一帧 RGB
-                this.bgReady = false;
+
+                // 帧差分状态
+                this.prevGray = new Float32Array(procW * procH);   // 上一帧灰度
+                this.accum     = new Float32Array(procW * procH);   // 运动累积图（衰减）
+                this.frameIdx  = 0;         // 帧计数（用于 warmup）
+                this.WARMUP    = 8;         // 前 N 帧只建立 prev，不输出有效 mask
+
+                // 运动热点网格（代理「手」）
                 this.activeHands = [];
-                this.cols = 8; this.rows = 6;    // 运动热点粗网格
+                this.cols = 8; this.rows = 6;
             }
 
             update(videoEl) {
                 const w = this.w, h = this.h, n = w * h;
-                // 原样绘制（非镜像）：镜像由 processMask 在采样时统一处理，
-                // 与原本 MediaPipe 遮罩的朝向保持一致。
+
+                // 缩小视频帧到处理分辨率
                 this.vctx.drawImage(videoEl, 0, 0, w, h);
                 const d = this.vctx.getImageData(0, 0, w, h).data;
 
-                if (!this.bgReady) {
-                    for (let i = 0; i < n; i++) {
-                        const o = i * 3;
-                        this.bg[o] = d[o]; this.bg[o + 1] = d[o + 1]; this.bg[o + 2] = d[o + 2];
-                        this.prev[o] = d[o]; this.prev[o + 1] = d[o + 1]; this.prev[o + 2] = d[o + 2];
-                    }
-                    this.bgReady = true;
-                }
+                // 转灰度 + 计算帧差
+                const diff = new Float32Array(n);      // 本帧差分绝对值
+                const gray = new Float32Array(n);       // 本帧灰度
+                const MOT_THRESH = 22;                  // 帧差阈值（0-255）
+                const ACCUM_RISE = 0.55;                // 有运动时累积上升速率
+                const ACCUM_DECAY = 0.88;               // 无运动时衰减速率（~0.88^60 ≈ 每秒漏掉 1/1000）
+                const OUTPUT_THRESH = 28;                // 输出mask阈值
 
-                const fgImg = this.fgCtx.createImageData(w, h);
-                const fd = fgImg.data;
-                const FG = 42;       // 前景阈值（RGB 欧氏距离）
-                const MOT = 80;      // 运动热点阈值（三通道绝对差之和）
-                const ADAPT = 0.04;  // 背景学习率（仅非前景处生效）
-
+                // 运动热点网格累加器
                 const cols = this.cols, rows = this.rows;
                 const cSum = new Float32Array(cols * rows);
                 const cX = new Float32Array(cols * rows);
                 const cY = new Float32Array(cols * rows);
 
                 for (let i = 0; i < n; i++) {
-                    const o = i * 3;
-                    const r = d[o], g = d[o + 1], b = d[o + 2];
-                    const br = this.bg[o], bg = this.bg[o + 1], bb = this.bg[o + 2];
-                    const dr = r - br, dg = g - bg, db = b - bb;
-                    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-                    const fg = dist > FG ? 1 : 0;
+                    // RGB → 灰度（人眼加权）
+                    const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+                    const gy = r * 0.299 + g * 0.587 + b * 0.114;
+                    gray[i] = gy;
 
-                    const pr = this.prev[o], pg = this.prev[o + 1], pb = this.prev[o + 2];
-                    const m = Math.abs(r - pr) + Math.abs(g - pg) + Math.abs(b - pb);
+                    // 与上一帧的绝对差
+                    const df = Math.abs(gy - this.prevGray[i]);
+                    diff[i] = df;
 
-                    const a = fg ? 255 : 0;
-                    fd[o] = 255; fd[o + 1] = 255; fd[o + 2] = 255; fd[o + 3] = a;
+                    // 运动累积：有差分就上升，没有就指数衰减
+                    if (df > MOT_THRESH) {
+                        this.accum[i] = Math.min(255, this.accum[i] + df * ACCUM_RISE);
+                    } else {
+                        this.accum[i] *= ACCUM_DECAY;
+                    }
 
-                    // 背景更新：仅在不前景处学习，人在场时不污染背景；人离场后背景缓慢追上
-                    const learn = fg === 0 ? ADAPT : 0;
-                    this.bg[o]     += (r - this.bg[o]) * learn;
-                    this.bg[o + 1] += (g - this.bg[o + 1]) * learn;
-                    this.bg[o + 2] += (b - this.bg[o + 2]) * learn;
-
-                    if (m > MOT) {
+                    // 运动热点收集
+                    if (df > MOT_THRESH * 1.8) {
                         const x = i % w, y = (i / w) | 0;
                         const ci = ((y * rows / h) | 0) * cols + ((x * cols / w) | 0);
-                        cSum[ci] += m; cX[ci] += x * m; cY[ci] += y * m;
+                        cSum[ci] += df; cX[ci] += x * df; cY[ci] += y * df;
                     }
-                    this.prev[o] = r; this.prev[o + 1] = g; this.prev[o + 2] = b;
+                }
+
+                // 保存当前灰度作为下一帧参考
+                this.prevGray.set(gray);
+                this.frameIdx++;
+
+                // 产出前景 mask（warmup 期间输出全零）
+                const fgImg = this.fgCtx.createImageData(w, h);
+                const fd = fgImg.data;
+                const isWarm = this.frameIdx <= this.WARMUP;
+
+                for (let i = 0; i < n; i++) {
+                    const o = i * 4;
+                    const a = (!isWarm && this.accum[i] > OUTPUT_THRESH) ? 255 : 0;
+                    fd[o] = 255; fd[o + 1] = 255; fd[o + 2] = 255; fd[o + 3] = a;
                 }
                 this.fgCtx.putImageData(fgImg, 0, 0);
+
+                // 轻微膨胀（3×3 最大值核）—— 填充轮廓内部空洞
+                if (!isWarm) this._dilate(this.fgCtx, w, h);
 
                 // 由运动网格选 Top-2 热点作为「手」（镜像映射到屏幕坐标）
                 const idx = [];
@@ -2482,15 +2499,36 @@
                 const sw = window.innerWidth, sh = window.innerHeight;
                 for (let k = 0; k < Math.min(2, idx.length); k++) {
                     const ci = idx[k], sum = cSum[ci];
-                    const cx = cX[ci] / sum, cy = cY[ci] / sum; // 小画布坐标（非镜像）
+                    const cx = cX[ci] / sum, cy = cY[ci] / sum;
                     hands.push({
-                        x: (1 - cx / w) * sw,                 // 镜像到屏幕
+                        x: (1 - cx / w) * sw,
                         y: (cy / h) * sh,
                         radius: 110,
                         velocity: Math.min(sum / 4000, 18)
                     });
                 }
                 this.activeHands = hands;
+            }
+
+            /** 3×3 膨胀核：对 alpha 通道做一次最大值滤波，填补轮廓内的小空洞 */
+            _dilate(ctx, w, h) {
+                const img = ctx.getImageData(0, 0, w, h);
+                const src = img.data;
+                const out = new Uint8ClampedArray(src);
+                for (let y = 1; y < h - 1; y++) {
+                    for (let x = 1; x < w - 1; x++) {
+                        let maxA = 0;
+                        for (let dy = -1; dy <= 1; dy++) {
+                            for (let dx = -1; dx <= 1; dx++) {
+                                const a = src[((y + dy) * w + (x + dx)) * 4 + 3];
+                                if (a > maxA) maxA = a;
+                            }
+                        }
+                        out[(y * w + x) * 4 + 3] = maxA;
+                    }
+                }
+                img.data.set(out);
+                ctx.putImageData(img, 0, 0);
             }
         }
 
