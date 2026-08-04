@@ -16,11 +16,13 @@
 
 ## 二、在线体验与部署
 
-- **线上地址（OpenDeploy 静态托管）**：https://1e5b3205.opendeploy.site
+- **线上地址（OpenDeploy 静态托管）**：<https://1e5b3205.opendeploy.site>
 - **部署方式**：纯静态站点，由 OpenDeploy 托管（`*.opendeploy.site`，production 环境），无需后端、无需构建步骤。
-- **源码仓库**：https://github.com/EriXPsy/DigitalArt
+- **源码仓库**：<https://github.com/EriXPsy/DigitalArt>
 
 > 说明：站点入口文件已从 `幻泡影.html` 重命名为 `index.html`，以便静态托管与 GitHub Pages 在根路径直接提供服务。
+
+
 
 ---
 
@@ -40,11 +42,11 @@ http://localhost:8000/
 ```
 
 - 直接以 `file://` 双击打开亦可体验，但浏览器会限制摄像头；此时可选择「无摄像头 · 观影演示」完整体验三卷篇章。
-- 首次加载需联网，从 CDN 拉取 Three.js、MediaPipe 等运行时依赖。
+- 首次加载需联网，从 CDN 拉取 Three.js 运行时依赖；感知层为纯前端 Canvas2D 实现，无需任何模型 / wasm 下载。
 
 ### 环境变量说明
 
-**本项目为纯前端应用，没有后端服务，因此不存在运行时环境变量或密钥配置。** Three.js、MediaPipe 等依赖均通过公开 CDN 加载，无需申请任何 API Token。
+**本项目为纯前端应用，没有后端服务，因此不存在运行时环境变量或密钥配置。** Three.js 等依赖通过公开 CDN 加载，无需申请任何 API Token；感知层用原生 Canvas2D 实现，不依赖任何第三方 CV 库。
 
 唯一与「配置」相关的是页面 `<head>` 中写死的 CDN 地址；若需离线 / 内网部署，可将这些资源本地化后修改对应引用即可，仍无需任何环境变量。
 
@@ -57,7 +59,7 @@ http://localhost:8000/
 1. **扉页**：进入作品，阅读题引经文。
 2. **授权摄像头**：点击「启动诗意捕捉」授权摄像头；或选择「无摄像头 · 观影演示」以虚拟身影完整体验。
 3. **立身明镜前**：站在摄像头前使全身可见（引导层分步提示）。
-4. **实时捕捉与呈现**：MediaPipe 实时分割身体轮廓，画面随动作流变为光 / 墨 / 泡沫。
+4. **实时捕捉与呈现**：纯前端 Canvas2D 背景差分实时提取身体轮廓（形场）与运动（势场），画面随动作流变为光 / 墨 / 泡沫。
 5. **篇章切换与收束**：通过底部控制条在「卷一·光 / 卷二·墨 / 卷三·沫」间切换；结束进入「观照圆满」收束页。
 
 ### AI 介入环节（透明说明）
@@ -73,18 +75,17 @@ http://localhost:8000/
 
 ## 五、技术栈清单
 
-| 类别 | 技术 | 说明 |
-|---|---|---|
-| 渲染 | [Three.js](https://threejs.org/) `0.180`（WebGL Renderer） | 主渲染引擎 |
-| 后期 | `EffectComposer` / `UnrealBloomPass` | 全屏辉光等后期处理 |
-| 着色器 | 自写 GLSL 顶点 / 片元着色器 | 粒子发光、拖尾、材质 |
-| 计算机视觉 | MediaPipe **Selfie Segmentation** | 实时人体轮廓分割 |
-| 计算机视觉 | MediaPipe **Hands** | 手势追踪（CDN 加载） |
-| 噪声 / 力场 | 自实现 2D `SimplexNoise` | 流场扰动 |
-| 样式 / 排版 | Tailwind CSS（CDN） | UI 布局 |
-| 字体 | Noto Serif SC（思源宋体，Google Fonts） | 东方排版气质 |
-| 工程形态 | ES Modules + `importmap` | **零构建**，无需 `npm install` / 打包 |
-| 部署 | OpenDeploy 静态托管 | production 环境 |
+| 类别      | 技术                                                       | 说明                            |
+| ------- | -------------------------------------------------------- | ----------------------------- |
+| 渲染      | [Three.js](https://threejs.org/) `0.180`（WebGL Renderer） | 主渲染引擎                         |
+| 后期      | `EffectComposer` / `UnrealBloomPass`                     | 全屏辉光等后期处理                     |
+| 着色器     | 自写 GLSL 顶点 / 片元着色器                                       | 粒子发光、拖尾、材质                    |
+| 计算机视觉   | 纯 **Canvas2D** 背景差分 + 帧差分（零 wasm）                     | 实时前景（形场）与运动（势场）提取；运动热点代理「手」 |
+| 噪声 / 力场 | 自实现 2D `SimplexNoise`                                    | 流场扰动                          |
+| 样式 / 排版 | Tailwind CSS（CDN）                                        | UI 布局                         |
+| 字体      | Noto Serif SC（思源宋体，Google Fonts）                         | 东方排版气质                        |
+| 工程形态    | ES Modules + `importmap`                                 | **零构建**，无需 `npm install` / 打包 |
+| 部署      | OpenDeploy 静态托管                                          | production 环境                 |
 
 ---
 
@@ -99,7 +100,7 @@ http://localhost:8000/
 
 ## 七、后续路线（规划中）
 
-- 感知层与渲染层时钟解耦（推理 ~20fps / 渲染 60fps）；
+- 感知层已改为纯 Canvas2D 背景差分（零 wasm、零模型下载），与渲染同帧运行，无需推理节流；
 - 以 GPU 上的「形场 / 势场 / 缘场」替代逐像素回读；
 - 粒子生灭状态机（「无常」的工程编码）；
 - 按章节拆分为可维护的模块化目录。

@@ -14,8 +14,9 @@
     </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@300;400;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <!-- 感知层已改为纯 Canvas2D 前景/运动提取（ForegroundExtractor），
+         不再依赖 MediaPipe 的 WebAssembly 推理，以规避 OpenDeploy 静态托管的 CSP
+         （其 script-src 缺 'wasm-unsafe-eval'，会阻死 wasm 编译）。 -->
 
     <style>
         * {
@@ -800,15 +801,10 @@
         let currentPhase = 'menu';
         let isLoading = true;
         let isPlaying = false;
-        let currentMask = null;
+        let currentMask = null;        // 前景遮罩 canvas（由 ForegroundExtractor 产出，供 processMask 采样）
         let lastVideoTime = -1;
-        let segmentationModel = null;
-        let handTracker = null;
-        let handsReady = false;
-        let activeHands = [];
-        let prevHands = [];
-        let handDetectPending = false;
-        let lastHandDetectTime = 0;
+        let fgExtractor = null;        // 纯 Canvas2D 前景/运动提取器（无 wasm，规避 OpenDeploy CSP）
+        let activeHands = [];          // 运动热点代理「手」：{x, y, radius, velocity}
         let cameraInitialized = false;
         let fpsLastTime = performance.now();
         let fpsFrameCount = 0;
@@ -2323,8 +2319,7 @@
         // ================================================================
         //  渲染循环
         // ================================================================
-        // 分割请求是否在途：避免 await 阻塞渲染循环
-        let segmentationPending = false;
+        // 感知层每帧在 renderLoop 内同步更新（见 ForegroundExtractor），无需在途标记
 
         function renderLoop() {
             if (!isPlaying) return;
@@ -2352,25 +2347,21 @@
                 fpsLastTime = now;
             }
 
-            // 非阻塞投喂视频帧：上一帧未处理完则跳过本帧（演示模式无需摄像头）
-            if (!isDemoMode && segmentationModel && !segmentationPending &&
-                videoElement.readyState >= 2 && videoElement.currentTime !== lastVideoTime) {
-                lastVideoTime = videoElement.currentTime;
-                segmentationPending = true;
-                Promise.resolve(segmentationModel.send({ image: videoElement }))
-                    .catch((err) => { console.error('[Segmentation] send failed:', err); })
-                    .finally(() => { segmentationPending = false; });
-                
-                // 同时投喂手部追踪（限流至 ~20fps）
-                if (handsReady && handTracker && !handDetectPending) {
-                    const now = performance.now();
-                    if (now - lastHandDetectTime > 50) {
-                        handDetectPending = true;
-                        lastHandDetectTime = now;
-                        Promise.resolve(handTracker.send({ image: videoElement }))
-                            .catch((err) => { console.warn('[Hands] send failed:', err); })
-                            .finally(() => { handDetectPending = false; });
+            // 感知层：纯 Canvas2D 前景/运动提取（无 wasm，规避 OpenDeploy 静态托管 CSP）。
+            // 摄像头开启时每帧从视频帧差分出前景遮罩与运动热点（代理「手」）；
+            // 首帧就绪即触发引导，与原 MediaPipe 首个分割结果的行为一致。
+            if (!isDemoMode && fgExtractor && videoElement.readyState >= 2) {
+                try {
+                    fgExtractor.update(videoElement);
+                    currentMask = fgExtractor.fgCanvas;
+                    activeHands = fgExtractor.activeHands;
+                    if (isLoading) {
+                        isLoading = false;
+                        clearTimeout(initTimeout);
+                        showGuide();
                     }
+                } catch (err) {
+                    console.error('[ForegroundExtractor] update failed:', err);
                 }
             }
 
@@ -2404,48 +2395,103 @@
         let initTimeout = null;
 
         // ================================================================
-        //  MediaPipe Hands 手部识别回调
+        //  前景 / 运动提取器（纯 Canvas2D，零 WebAssembly）
+        //  背景差分 + 帧差分，从视频帧解出「形场」(前景遮罩) 与
+        //  「势场」(运动强度)，并取运动最活跃的网格单元作为手部交互代理。
+        //  用以替代 MediaPipe 的 wasm 推理 —— 规避 OpenDeploy 静态托管的
+        //  CSP（其 script-src 缺 'wasm-unsafe-eval'，会阻死 wasm 编译）。
         // ================================================================
-        function onHandResults(results) {
-            let currentHands = [];
-            if (results.multiHandLandmarks) {
-                const w = window.innerWidth, h = window.innerHeight;
-                for (let landmarks of results.multiHandLandmarks) {
-                    // 使用中指尖（landmark 12）作为手部位置
-                    let pt = landmarks[12];
-                    let cx = (1 - pt.x) * w; // 镜像X
-                    let cy = pt.y * h;
-                    currentHands.push({ x: cx, y: cy });
-                }
+        class ForegroundExtractor {
+            constructor(procW = 160, procH = 120) {
+                this.w = procW; this.h = procH;
+                this.video = document.createElement('canvas');
+                this.video.width = procW; this.video.height = procH;
+                this.vctx = this.video.getContext('2d', { willReadFrequently: true });
+                this.fg = document.createElement('canvas');
+                this.fg.width = procW; this.fg.height = procH;
+                this.fgCtx = this.fg.getContext('2d');
+                this.fgCanvas = this.fg;          // 供 processMask 直接 drawImage 采样
+                this.bg = new Float32Array(procW * procH * 3);   // 背景 RGB 模型
+                this.prev = new Float32Array(procW * procH * 3); // 上一帧 RGB
+                this.bgReady = false;
+                this.activeHands = [];
+                this.cols = 8; this.rows = 6;    // 运动热点粗网格
             }
-            
-            // 计算手部位移速度
-            activeHands = currentHands.map((h, i) => {
-                let ph = prevHands[i] || h;
-                let vx = h.x - ph.x;
-                let vy = h.y - ph.y;
-                let vel = Math.sqrt(vx * vx + vy * vy);
-                return {
-                    x: h.x, y: h.y,
-                    vx: vx, vy: vy,
-                    velocity: vel,
-                    radius: 100 // 手部作用半径
-                };
-            });
-            prevHands = currentHands;
-        }
 
-        // ================================================================
-        //  MediaPipe Selfie Segmentation 回调
-        // ================================================================
-        function onSegmentationResults(results) {
-            if (isLoading) {
-                isLoading = false;
-                clearTimeout(initTimeout);
-                // 摄像头已就绪，显示引导而非直接进入
-                showGuide();
+            update(videoEl) {
+                const w = this.w, h = this.h, n = w * h;
+                // 原样绘制（非镜像）：镜像由 processMask 在采样时统一处理，
+                // 与原本 MediaPipe 遮罩的朝向保持一致。
+                this.vctx.drawImage(videoEl, 0, 0, w, h);
+                const d = this.vctx.getImageData(0, 0, w, h).data;
+
+                if (!this.bgReady) {
+                    for (let i = 0; i < n; i++) {
+                        const o = i * 3;
+                        this.bg[o] = d[o]; this.bg[o + 1] = d[o + 1]; this.bg[o + 2] = d[o + 2];
+                        this.prev[o] = d[o]; this.prev[o + 1] = d[o + 1]; this.prev[o + 2] = d[o + 2];
+                    }
+                    this.bgReady = true;
+                }
+
+                const fgImg = this.fgCtx.createImageData(w, h);
+                const fd = fgImg.data;
+                const FG = 42;       // 前景阈值（RGB 欧氏距离）
+                const MOT = 80;      // 运动热点阈值（三通道绝对差之和）
+                const ADAPT = 0.04;  // 背景学习率（仅非前景处生效）
+
+                const cols = this.cols, rows = this.rows;
+                const cSum = new Float32Array(cols * rows);
+                const cX = new Float32Array(cols * rows);
+                const cY = new Float32Array(cols * rows);
+
+                for (let i = 0; i < n; i++) {
+                    const o = i * 3;
+                    const r = d[o], g = d[o + 1], b = d[o + 2];
+                    const br = this.bg[o], bg = this.bg[o + 1], bb = this.bg[o + 2];
+                    const dr = r - br, dg = g - bg, db = b - bb;
+                    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+                    const fg = dist > FG ? 1 : 0;
+
+                    const pr = this.prev[o], pg = this.prev[o + 1], pb = this.prev[o + 2];
+                    const m = Math.abs(r - pr) + Math.abs(g - pg) + Math.abs(b - pb);
+
+                    const a = fg ? 255 : 0;
+                    fd[o] = 255; fd[o + 1] = 255; fd[o + 2] = 255; fd[o + 3] = a;
+
+                    // 背景更新：仅在不前景处学习，人在场时不污染背景；人离场后背景缓慢追上
+                    const learn = fg === 0 ? ADAPT : 0;
+                    this.bg[o]     += (r - this.bg[o]) * learn;
+                    this.bg[o + 1] += (g - this.bg[o + 1]) * learn;
+                    this.bg[o + 2] += (b - this.bg[o + 2]) * learn;
+
+                    if (m > MOT) {
+                        const x = i % w, y = (i / w) | 0;
+                        const ci = ((y * rows / h) | 0) * cols + ((x * cols / w) | 0);
+                        cSum[ci] += m; cX[ci] += x * m; cY[ci] += y * m;
+                    }
+                    this.prev[o] = r; this.prev[o + 1] = g; this.prev[o + 2] = b;
+                }
+                this.fgCtx.putImageData(fgImg, 0, 0);
+
+                // 由运动网格选 Top-2 热点作为「手」（镜像映射到屏幕坐标）
+                const idx = [];
+                for (let i = 0; i < cSum.length; i++) if (cSum[i] > 0) idx.push(i);
+                idx.sort((a, b) => cSum[b] - cSum[a]);
+                const hands = [];
+                const sw = window.innerWidth, sh = window.innerHeight;
+                for (let k = 0; k < Math.min(2, idx.length); k++) {
+                    const ci = idx[k], sum = cSum[ci];
+                    const cx = cX[ci] / sum, cy = cY[ci] / sum; // 小画布坐标（非镜像）
+                    hands.push({
+                        x: (1 - cx / w) * sw,                 // 镜像到屏幕
+                        y: (cy / h) * sh,
+                        radius: 110,
+                        velocity: Math.min(sum / 4000, 18)
+                    });
+                }
+                this.activeHands = hands;
             }
-            currentMask = results.segmentationMask;
         }
 
         // ================================================================
@@ -2481,9 +2527,10 @@
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                     throw new Error("当前环境不支持视觉感知 API。");
                 }
-                if (typeof SelfieSegmentation === 'undefined') {
-                    throw new Error("感知模块（MediaPipe）未能加载，请检查网络连接后重试。");
-                }
+                // 初始化纯 Canvas2D 前景/运动提取器（无 wasm，规避 OpenDeploy 静态托管 CSP）
+                // 背景差分 + 帧差分替代 MediaPipe，从视频帧解形场与势场，并产出运动热点作手部代理。
+                fgExtractor = new ForegroundExtractor(160, 120);
+
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: { width: 640, height: 480, facingMode: 'user' },
                     audio: false
@@ -2507,31 +2554,6 @@
                         reject(new Error("视频元素加载失败"));
                     };
                 });
-                segmentationModel = new SelfieSegmentation({
-                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
-                });
-                segmentationModel.setOptions({ modelSelection: 1 });
-                segmentationModel.onResults(onSegmentationResults);
-                
-                // 初始化 MediaPipe Hands 手部追踪
-                if (typeof Hands !== 'undefined') {
-                    handTracker = new Hands({
-                        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-                    });
-                    handTracker.setOptions({
-                        maxNumHands: 2,
-                        modelComplexity: 1,
-                        minDetectionConfidence: 0.5,
-                        minTrackingConfidence: 0.5
-                    });
-                    handTracker.onResults(onHandResults);
-                    handTracker.initialize().then(() => {
-                        handsReady = true;
-                        console.log('[Hands] initialized');
-                    }).catch((err) => {
-                        console.warn('[Hands] init failed:', err);
-                    });
-                }
                 
                 initThreeJS();
                 resizeCanvas();
@@ -2540,7 +2562,7 @@
                 isPlaying = true;
                 requestAnimationFrame(renderLoop);
 
-                // 等待第一帧 mask 到达后由 onSegmentationResults 触发引导
+                // 引导由 renderLoop 内首帧前景就绪（ForegroundExtractor）触发
             } catch (error) {
                 console.error("Initialization Error:", error);
                 clearTimeout(initTimeout);
