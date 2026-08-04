@@ -2401,8 +2401,10 @@
         //  用以替代 MediaPipe 的 wasm 推理 —— 规避 OpenDeploy 静态托管的
         //  CSP（其 script-src 缺 'wasm-unsafe-eval'，会阻死 wasm 编译）。
         //
-        //  算法：帧差分（当前帧 vs 上一帧）→ 运动热图 → 指数衰减累积
-        //  → 阈值二值化 → 形态学清理。无需干净背景帧，首帧即可工作。
+        //  三信号融合，保证「静止也可见、动起来有反应」：
+        //   1) 帧差分 —— 检测运动区域（挥手、走动）
+        //   2) 自适应背景对比 —— 检测与背景颜色不同的人体（即使完全静止）
+        //   3) 残影种子 —— 真实信号过低时淡入最近形状的记忆，启动/静止不空白
         // ================================================================
         class ForegroundExtractor {
             constructor(procW = 160, procH = 120) {
@@ -2415,81 +2417,119 @@
                 this.fgCtx = this.fg.getContext('2d');
                 this.fgCanvas = this.fg;          // 供 processMask 直接 drawImage 采样
 
-                // 帧差分状态
-                this.prevGray = new Float32Array(procW * procH);   // 上一帧灰度
-                this.accum     = new Float32Array(procW * procH);   // 运动累积图（衰减）
-                this.frameIdx  = 0;         // 帧计数（用于 warmup）
-                this.WARMUP    = 8;         // 前 N 帧只建立 prev，不输出有效 mask
+                const n = procW * procH;
+                this.n = n;
+                // 自适应背景模型（RGB）+ 背景方差（灰度）
+                this.bg = new Float32Array(n * 3);
+                this.bgVar = new Float32Array(n);
+                this.prevGray = new Float32Array(n);       // 上一帧灰度（帧差用）
+                this.accum = new Float32Array(n);          // 融合后的「存在感」图
+                this.ghost = new Float32Array(n);          // 残影：最近出现过的形状记忆
+                this.frameIdx = 0;
+                this.WARMUP = 24;                          // 前 N 帧建立背景，不输出
 
                 // 运动热点网格（代理「手」）
                 this.activeHands = [];
                 this.cols = 8; this.rows = 6;
+
+                // 残影种子强度（当真实存在感过低时淡入，保证静止也可见）
+                this.seed = 0;
             }
 
             update(videoEl) {
-                const w = this.w, h = this.h, n = w * h;
-
-                // 缩小视频帧到处理分辨率
+                const w = this.w, h = this.h, n = this.n;
                 this.vctx.drawImage(videoEl, 0, 0, w, h);
                 const d = this.vctx.getImageData(0, 0, w, h).data;
 
-                // 转灰度 + 计算帧差
-                const diff = new Float32Array(n);      // 本帧差分绝对值
-                const gray = new Float32Array(n);       // 本帧灰度
-                const MOT_THRESH = 22;                  // 帧差阈值（0-255）
-                const ACCUM_RISE = 0.55;                // 有运动时累积上升速率
-                const ACCUM_DECAY = 0.88;               // 无运动时衰减速率（~0.88^60 ≈ 每秒漏掉 1/1000）
-                const OUTPUT_THRESH = 28;                // 输出mask阈值
+                // —— 阈值与速率（针对摄像头噪声校准）——
+                const MOT_THRESH   = 16;    // 帧差运动阈值
+                const STATIC_BASE  = 28;    // 背景对比基础阈值
+                const STATIC_K     = 3.2;   // 方差自适应乘子
+                const BG_ALPHA     = 0.012; // 背景学习率（缓慢，使静止人体约 2s 后显形）
+                const VAR_ALPHA    = 0.03;  // 方差 EMA 速率
+                const ACCUM_RISE   = 0.55;  // 存在感上升
+                const ACCUM_DECAY  = 0.95;  // 存在感衰减（慢 → 静止时持续可见）
+                const OUTPUT_THRESH = 42;   // 输出遮罩阈值
 
-                // 运动热点网格累加器
                 const cols = this.cols, rows = this.rows;
                 const cSum = new Float32Array(cols * rows);
                 const cX = new Float32Array(cols * rows);
                 const cY = new Float32Array(cols * rows);
+                let presenceCount = 0;
 
                 for (let i = 0; i < n; i++) {
-                    // RGB → 灰度（人眼加权）
-                    const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+                    const o = i * 4;
+                    const r = d[o], g = d[o + 1], b = d[o + 2];
                     const gy = r * 0.299 + g * 0.587 + b * 0.114;
-                    gray[i] = gy;
 
-                    // 与上一帧的绝对差
-                    const df = Math.abs(gy - this.prevGray[i]);
-                    diff[i] = df;
-
-                    // 运动累积：有差分就上升，没有就指数衰减
-                    if (df > MOT_THRESH) {
-                        this.accum[i] = Math.min(255, this.accum[i] + df * ACCUM_RISE);
-                    } else {
-                        this.accum[i] *= ACCUM_DECAY;
+                    if (this.frameIdx < this.WARMUP) {
+                        this.bg[o] = r; this.bg[o + 1] = g; this.bg[o + 2] = b;
+                        this.bgVar[i] = 0; this.prevGray[i] = gy;
+                        continue; // warmup 期间不输出
                     }
 
-                    // 运动热点收集
-                    if (df > MOT_THRESH * 1.8) {
+                    // 帧差（运动）
+                    const df = Math.abs(gy - this.prevGray[i]);
+
+                    // 自适应背景 + 方差
+                    const br = this.bg[o], bg_g = this.bg[o + 1], bb = this.bg[o + 2];
+                    const dr = r - br, dg = g - bg_g, db = b - bb;
+                    const staticDist = Math.sqrt(dr * dr + dg * dg + db * db);
+                    const thresh = STATIC_BASE + STATIC_K * Math.sqrt(this.bgVar[i]);
+                    const isStaticFG = staticDist > thresh;   // 与背景不同 → 人（即使静止）
+                    const isMotion = df > MOT_THRESH;
+
+                    // 背景缓慢学习（处处都学，使静止人体约 2s 后对比显形；背景区域更快收敛）
+                    this.bg[o]     += (r - this.bg[o]) * BG_ALPHA;
+                    this.bg[o + 1] += (g - this.bg[o + 1]) * BG_ALPHA;
+                    this.bg[o + 2] += (b - this.bg[o + 2]) * BG_ALPHA;
+                    const resid = gy - (br * 0.299 + bg_g * 0.587 + bb * 0.114);
+                    this.bgVar[i] += (resid * resid - this.bgVar[i]) * VAR_ALPHA;
+
+                    // 融合信号：运动 或 静态对比 → 提升存在感；否则缓慢衰减
+                    const signal = isStaticFG || isMotion;
+                    if (signal) {
+                        const add = isMotion ? df * ACCUM_RISE : 55; // 静止对比给稳定增益
+                        this.accum[i] = Math.min(255, this.accum[i] + add);
+                        // 残影记忆：记录最近出现的形状（似真似幻的"痕迹"）
+                        this.ghost[i] = Math.max(this.ghost[i] * 0.992, 1);
+                    } else {
+                        this.accum[i] *= ACCUM_DECAY;
+                        this.ghost[i] *= 0.992;
+                    }
+
+                    if (this.accum[i] > OUTPUT_THRESH) presenceCount++;
+
+                    // 运动热点（代理「手」）
+                    if (df > MOT_THRESH * 2) {
                         const x = i % w, y = (i / w) | 0;
                         const ci = ((y * rows / h) | 0) * cols + ((x * cols / w) | 0);
                         cSum[ci] += df; cX[ci] += x * df; cY[ci] += y * df;
                     }
+                    this.prevGray[i] = gy;
                 }
-
-                // 保存当前灰度作为下一帧参考
-                this.prevGray.set(gray);
                 this.frameIdx++;
 
-                // 产出前景 mask（warmup 期间输出全零）
+                // 残影种子：真实存在感过低时淡入（保证启动/完全静止也能看到自己）
+                const presenceRatio = presenceCount / n;
+                if (presenceRatio < 0.04) this.seed = Math.min(1, this.seed + 0.03);
+                else this.seed = Math.max(0, this.seed - 0.06);
+
+                // 产出遮罩
                 const fgImg = this.fgCtx.createImageData(w, h);
                 const fd = fgImg.data;
-                const isWarm = this.frameIdx <= this.WARMUP;
-
                 for (let i = 0; i < n; i++) {
                     const o = i * 4;
-                    const a = (!isWarm && this.accum[i] > OUTPUT_THRESH) ? 255 : 0;
+                    let a = this.accum[i] > OUTPUT_THRESH ? 255 : 0;
+                    if (this.seed > 0) {
+                        // 用残影记忆作软形状，而非生硬矩形
+                        const sa = this.seed * this.ghost[i] * 210;
+                        if (sa > a) a = Math.min(255, sa);
+                    }
                     fd[o] = 255; fd[o + 1] = 255; fd[o + 2] = 255; fd[o + 3] = a;
                 }
                 this.fgCtx.putImageData(fgImg, 0, 0);
-
-                // 轻微膨胀（3×3 最大值核）—— 填充轮廓内部空洞
-                if (!isWarm) this._dilate(this.fgCtx, w, h);
+                if (this.seed < 0.5) this._dilate(this.fgCtx, w, h); // 有真实轮廓时才膨胀
 
                 // 由运动网格选 Top-2 热点作为「手」（镜像映射到屏幕坐标）
                 const idx = [];
